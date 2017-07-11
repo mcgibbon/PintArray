@@ -110,18 +110,19 @@ class PintArray(xr.DataArray, pint.Quantity):
     def __add__(self, other):
         return self._add_sub(other, operator.add)
 
+    __radd__ = __add__
+
     def __sub__(self, other):
         return self._add_sub(other, operator.sub)
 
+    def __rsub__(self, other):
+        return -self._add_sub(other, operator.sub)
+
     def __iadd__(self, other):
-        if isinstance(other, xr.DataArray) and ('units' in other.attrs):
-            other = data_array_to_units(other, self._units)
-        return super(PintArray, self).__iadd__(other)
+        return self._add_sub(other, operator.iadd)
 
     def __isub__(self, other):
-        if isinstance(other, xr.DataArray) and ('units' in other.attrs):
-            other = data_array_to_units(other, self._units)
-        return super(PintArray, self).__isub__(other)
+        return self._add_sub(other, operator.isub)
 
     def _add_sub(self, other, op):
         if isinstance(other, xr.DataArray) and ('units' in other.attrs):
