@@ -11,21 +11,28 @@ class PintArrayUnitRegistry(pint.UnitRegistry):
 
     def __call__(self, input_string, **kwargs):
         return super(UnitRegistry, self).__call__(
+            # These replacements are necessary because Pint produces errors
+            # if you give it these characters.
             input_string.replace(
                 u'%', 'percent').replace(
                 u'°', 'degree'
             ),
             **kwargs)
 
+    def Quantity(self, object, units):
+        return Quantity(object, units)
+
 
 unit_registry = PintArrayUnitRegistry()
 unit_registry.define('degrees_north = degree_north = degree_N = degrees_N = degreeN = degreesN')
 unit_registry.define('degrees_east = degree_east = degree_E = degrees_E = degreeE = degreesE')
-unit_registry.define('percent = 0.01*count = %')
+unit_registry.define('percent = 0.01*count')
 
 
 def is_valid_unit(unit_string):
     """Returns True if the unit string is recognized, and False otherwise."""
+    # These replacements are necessary because Pint produces errors if you
+    # give it these characters.
     unit_string = unit_string.replace(
         '%', 'percent').replace(
         '°', 'degree')
@@ -50,7 +57,7 @@ def data_array_to_units(value, to_units, inplace=False):
             new = value.copy(deep=True)
         from_units = value.attrs['units']
         unit_registry.convert(new.values, from_units, to_units, inplace=True)
-        new.attrs['units'] = to_units
+        new.attrs['units'] = str(to_units)
         return new
 
 
@@ -67,36 +74,44 @@ class UnitContainer():
 
 
 def Quantity(object, units):
-    if isinstance(object, PintArray):
-        raise NotImplementedError()
-    elif isinstance(object, xr.DataArray):
-        raise NotImplementedError()
-    else:
-        if not isinstance(units, string_types):
-            raise NotImplementedError()
-        return PintArray(object, attrs={'units': units})
+    return PintArray(object, attrs={'units': str(units)})
 
-
-def Quantity(data, units):
-    return PintArray(data, attrs={'units': str(units)})
 
 def UnitRegistry():
     return unit_registry
 
+
+def get_dimensionality(pint_array):
+    return unit_registry.get_dimensionality(pint_array.attrs['units'])
+
+
+def has_compatible_delta(pint_array, unit):
+    """
+    Check if pint_array has a delta_ unit that is compatible with unit.
+    """
+    deltas = get_delta_units(pint_array)
+    if 'delta_' + unit in deltas:
+        return True
+    else:  # Look for delta units with same dimension as the offset unit
+        offset_unit_dim = unit_registry(unit).reference
+        for d in deltas:
+            if unit_registry(d).reference == offset_unit_dim:
+                return True
+    return False
+
+
 class PintArray(xr.DataArray, pint.Quantity):
 
+    _REGISTRY = unit_registry
+
     # TODO: make add and sub work with non-multiplicative units
-    #       e.g. delta_degK
+    #       e.g. degC, degK, delta_degK
 
     def __add__(self, other):
-        if isinstance(other, xr.DataArray) and ('units' in other.attrs):
-            other = data_array_to_units(other, self._units)
-        return super(PintArray, self).__add__(other)
+        return self._add_sub(other, operator.add)
 
     def __sub__(self, other):
-        if isinstance(other, xr.DataArray) and ('units' in other.attrs):
-            other = data_array_to_units(other, self._units)
-        return super(PintArray, self).__sub__(other)
+        return self._add_sub(other, operator.sub)
 
     def __iadd__(self, other):
         if isinstance(other, xr.DataArray) and ('units' in other.attrs):
@@ -107,6 +122,82 @@ class PintArray(xr.DataArray, pint.Quantity):
         if isinstance(other, xr.DataArray) and ('units' in other.attrs):
             other = data_array_to_units(other, self._units)
         return super(PintArray, self).__isub__(other)
+
+    def _add_sub(self, other, op):
+        if isinstance(other, xr.DataArray) and ('units' in other.attrs):
+            if not get_dimensionality(self) == get_dimensionality(other):
+                raise pint.DimensionalityError(
+                    self._units, unit_registry(other.attrs['units']),
+                    get_dimensionality(self),
+                    get_dimensionality(other),
+                )
+
+            self_non_mul_units = get_non_multiplicative_units(self)
+            self_is_multiplicative = len(self_non_mul_units) == 0
+            other_non_mul_units = get_non_multiplicative_units(other)
+            other_is_multiplicative = len(other_non_mul_units) == 0
+            if self_is_multiplicative and other_is_multiplicative:
+                if self._units == unit_registry(other.attrs['units']):
+                    array = op(self, other)
+                    array.attrs['units'] = self.attrs['units']
+                elif get_delta_units(self) and not get_delta_units(other):
+                    array = op(self.to(other.attrs['units']), other)
+                    array.attrs['units'] = other.attrs['units']
+                else:
+                    array = op(
+                        self,
+                        data_array_to_units(other, self._units),
+                    )
+                    array.attrs['units'] = self.attrs['units']
+            elif (
+                    op == operator.sub and
+                    len(self_non_mul_units) == 1 and
+                    self._units[self_non_mul_units[0]] == 1 and
+                    not has_compatible_delta(other, self_non_mul_units[0])):
+                if self._units == unit_registry(other.attrs['units']):
+                    array = op(self, other)
+                    array.attrs['units'] = self.attrs['units']
+                else:
+                    array = op(
+                        self,
+                        data_array_to_units(other, self._units)
+                    )
+                    array.attrs['units'] = self.attrs['units']
+            elif (
+                    op == operator.sub and
+                    len(other_non_mul_units) == 1 and
+                    unit_registry(other.attrs['units'])[other_non_mul_units[0]] == 1 and
+                    not has_compatible_delta(self, other_non_mul_units[0])):
+                array = op(self, data_array_to_units(other, self._units))
+                array.attrs['units'] = self.attrs['units']
+            elif (
+                    len(self_non_mul_units) == 1 and
+                    self._units[self_non_mul_units[0]] == 1 and
+                    has_compatible_delta(other, self_non_mul_units[0])):
+                to_units = self._units.rename(
+                    self_non_mul_units[0], 'delta_' + self_non_mul_units[0])
+                array = op(self, data_array_to_units(other, to_units))
+                array.attrs['units'] = self.attrs['units']
+            elif (
+                    len(other_non_mul_units) == 1 and
+                    unit_registry(other.attrs['units'])[other_non_mul_units[0]] == 1 and
+                    has_compatible_delta(self, other_non_mul_units[0])):
+                to_units = other._units.rename(
+                    other_non_mul_units[0], 'delta_' + other_non_mul_units[0])
+                array = op(self.to(to_units), other)
+                array.attrs['units'] = other.attrs['units']
+            else:
+                raise pint.OffsetUnitCalculusError(
+                    self._units, unit_registry(other.attrs['units']))
+        elif other == 0:
+            array = op(self, other)
+            array.attrs['units'] = ''
+        elif self.dimensionless:
+            array = op(self.to(''), other)
+            array.attrs['units'] = ''
+        else:
+            raise pint.DimensionalityError(self._units, 'dimensionless')
+        return array
 
     def to_units(self, units, inplace=False):
         """
@@ -160,7 +251,7 @@ class PintArray(xr.DataArray, pint.Quantity):
 
     @property
     def dimensionality(self):
-        return unit_registry.get_dimensionality(self._units)
+        return get_dimensionality(self)
 
     def to(self, other):
         return self.to_units(other)
@@ -186,7 +277,7 @@ class PintArray(xr.DataArray, pint.Quantity):
 
     @property
     def _units(self):
-        return self.attrs['units']
+        return unit_registry(self.attrs['units'])
 
     def compatible_units(self):
         return unit_registry.get_compatible_units(self._units)
@@ -215,3 +306,19 @@ class PintArray(xr.DataArray, pint.Quantity):
     __gt__ = lambda self, other: self.compare(other, op=operator.gt)
     __eq__ = lambda self, other: self.compare(other, op=operator.eq)
     __ne__ = lambda self, other: self.compare(other, op=operator.ne)
+
+    def _get_delta_units(self):
+        return get_delta_units(self)
+
+    def _get_non_multiplicative_units(self):
+        return get_non_multiplicative_units(self)
+
+
+def get_delta_units(pint_array):
+    return [u for u in pint_array._units.keys()
+            if u.startswith('delta_')]
+
+
+def get_non_multiplicative_units(pint_array):
+    return [u for u in pint_array._units.keys()
+            if not unit_registry(u).is_multiplicative]
